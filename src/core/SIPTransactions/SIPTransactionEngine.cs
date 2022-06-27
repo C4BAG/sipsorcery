@@ -30,8 +30,8 @@ namespace SIPSorcery.SIP
     internal class SIPTransactionEngine
     {
         private const string TXENGINE_THREAD_NAME = "sip-txengine";
-        private const int MAX_TXCHECK_WAIT_MILLISECONDS = 200; // Time to wait between checking for new pending transactions.
-        private const int TXCHECK_WAIT_MILLISECONDS = 50;       // Time to wait between checking for actions on existing transactions.
+        private const int MAX_TXCHECK_WAIT_MILLISECONDS = 20; // Time to wait between checking for new pending transactions.
+        private const int TXCHECK_WAIT_MILLISECONDS = 2;       // Time to wait between checking for actions on existing transactions.
         private static readonly int m_t1 = SIPTimings.T1;
         private static readonly int m_t2 = SIPTimings.T2;
         private static readonly int m_t6 = SIPTimings.T6;
@@ -312,179 +312,178 @@ namespace SIPSorcery.SIP
                     if (m_pendingTransactions.IsEmpty)
                     {
                         Thread.Sleep(MAX_TXCHECK_WAIT_MILLISECONDS);
+                        continue;
                     }
-                    else
+
+                    foreach (var (_, transaction) in m_pendingTransactions.Where(x => x.Value.DeliveryPending))
                     {
-                        foreach (var (_, transaction) in m_pendingTransactions.Where(x => x.Value.DeliveryPending))
+                        try
                         {
-                            try
+                            if (transaction.TransactionState == SIPTransactionStatesEnum.Terminated ||
+                                transaction.TransactionState == SIPTransactionStatesEnum.Confirmed ||
+                                transaction.HasTimedOut)
                             {
-                                if (transaction.TransactionState == SIPTransactionStatesEnum.Terminated ||
-                                        transaction.TransactionState == SIPTransactionStatesEnum.Confirmed ||
-                                        transaction.HasTimedOut)
+                                transaction.DeliveryPending = false;
+                            }
+                            else if (transaction.HasDeliveryExpired(m_t6))
+                            {
+                                if (transaction.TransactionState == SIPTransactionStatesEnum.Proceeding)
                                 {
-                                    transaction.DeliveryPending = false;
-                                }
-                                else if (transaction.HasDeliveryExpired(m_t6))
-                                {
-                                    if (transaction.TransactionState == SIPTransactionStatesEnum.Proceeding)
-                                    {
-                                        // If the transaction is a UAS and still in the progress state then the timeout was 
-                                        // for a provisional response and it should not set any transaction properties that 
-                                        // will affect the delivery of any subsequent final response.
-                                        transaction.OnTimedOutProvisionalResponse();
-                                    }
-                                    else
-                                    {
-                                        transaction.Expire(DateTime.Now);
-                                    }
+                                    // If the transaction is a UAS and still in the progress state then the timeout was 
+                                    // for a provisional response and it should not set any transaction properties that 
+                                    // will affect the delivery of any subsequent final response.
+                                    transaction.OnTimedOutProvisionalResponse();
                                 }
                                 else
                                 {
-                                    if (transaction.DeliveryPending && transaction.IsRetransmitDue(m_t1, m_t2))
+                                    transaction.Expire(DateTime.Now);
+                                }
+                            }
+                            else
+                            {
+                                if (transaction.DeliveryPending && transaction.IsRetransmitDue(m_t1, m_t2))
+                                {
+                                    SocketError sendResult = SocketError.Success;
+
+                                    switch (transaction.TransactionType)
                                     {
-                                        SocketError sendResult = SocketError.Success;
+                                        case SIPTransactionTypesEnum.InviteServer:
 
-                                        switch (transaction.TransactionType)
-                                        {
-                                            case SIPTransactionTypesEnum.InviteServer:
+                                            switch (transaction.TransactionState)
+                                            {
+                                                case SIPTransactionStatesEnum.Calling:
+                                                    break;
 
-                                                switch (transaction.TransactionState)
-                                                {
-                                                    case SIPTransactionStatesEnum.Calling:
-                                                        break;
+                                                case SIPTransactionStatesEnum.Trying:
+                                                    break;
 
-                                                    case SIPTransactionStatesEnum.Trying:
-                                                        break;
+                                                case SIPTransactionStatesEnum.Proceeding:
+                                                    if (transaction.ReliableProvisionalResponse != null)
+                                                    {
+                                                        sendResult = SendTransactionProvisionalResponse(transaction).Result;
+                                                    }
+                                                    break;
 
-                                                    case SIPTransactionStatesEnum.Proceeding:
-                                                        if (transaction.ReliableProvisionalResponse != null)
-                                                        {
-                                                            sendResult = SendTransactionProvisionalResponse(transaction).Result;
-                                                        }
-                                                        break;
+                                                case SIPTransactionStatesEnum.Completed:
+                                                    sendResult = SendTransactionFinalResponse(transaction).Result;
+                                                    break;
 
-                                                    case SIPTransactionStatesEnum.Completed:
-                                                        sendResult = SendTransactionFinalResponse(transaction).Result;
-                                                        break;
+                                                case SIPTransactionStatesEnum.Confirmed:
+                                                    transaction.DeliveryPending = false;
+                                                    break;
 
-                                                    case SIPTransactionStatesEnum.Confirmed:
+                                                case SIPTransactionStatesEnum.Cancelled:
+                                                    sendResult = SendTransactionFinalResponse(transaction).Result;
+                                                    break;
+
+                                                default:
+                                                    logger.LogWarning($"InviteServer Transaction entered an unexpected transaction state {transaction.TransactionState}.");
+                                                    transaction.DeliveryFailed = true;
+                                                    break;
+                                            }
+                                            break;
+
+                                        case SIPTransactionTypesEnum.InviteClient:
+
+                                            switch (transaction.TransactionState)
+                                            {
+                                                case SIPTransactionStatesEnum.Calling:
+                                                    sendResult = SendTransactionRequest(transaction).Result;
+                                                    break;
+
+                                                case SIPTransactionStatesEnum.Trying:
+                                                    break;
+
+                                                case SIPTransactionStatesEnum.Proceeding:
+                                                    transaction.DeliveryPending = false;
+                                                    break;
+
+                                                case SIPTransactionStatesEnum.Completed:
+                                                    transaction.DeliveryPending = false;
+                                                    break;
+
+                                                case SIPTransactionStatesEnum.Confirmed:
+                                                    transaction.DeliveryPending = false;
+                                                    break;
+
+                                                case SIPTransactionStatesEnum.Cancelled:
+                                                    transaction.DeliveryPending = false;
+                                                    break;
+
+                                                default:
+                                                    logger.LogWarning($"InviteClient Transaction entered an unexpected transaction state {transaction.TransactionState}.");
+                                                    transaction.DeliveryFailed = true;
+                                                    break;
+                                            }
+
+                                            break;
+
+                                        case SIPTransactionTypesEnum.NonInvite:
+
+                                            switch (transaction.TransactionState)
+                                            {
+                                                case SIPTransactionStatesEnum.Calling:
+                                                    sendResult = SendTransactionRequest(transaction).Result;
+                                                    break;
+
+                                                case SIPTransactionStatesEnum.Trying:
+                                                    break;
+
+                                                case SIPTransactionStatesEnum.Proceeding:
+                                                    break;
+
+                                                case SIPTransactionStatesEnum.Completed:
+                                                    if (transaction.TransactionFinalResponse != null)
+                                                    {
+                                                        // Sending a single final response on a non-INVITE tx. The same response
+                                                        // will be automatically resent if the same request is received.
+
+                                                        // If retransmits are disabled we must wait for DNS when sending. By default the DNS lookup mechanism
+                                                        // will silently do nothing if the lookup result is not in the cache and relies on the result
+                                                        // being ready for a subsequent SIP retransmit. This mechanism won't work if SIP retransmits are disabled.
+                                                        bool waitForDns = DisableRetransmitSending;
+
+                                                        sendResult = m_sipTransport.SendResponseAsync(transaction.TransactionFinalResponse, waitForDns).Result;
                                                         transaction.DeliveryPending = false;
-                                                        break;
+                                                    }
+                                                    break;
 
-                                                    case SIPTransactionStatesEnum.Cancelled:
-                                                        sendResult = SendTransactionFinalResponse(transaction).Result;
-                                                        break;
+                                                case SIPTransactionStatesEnum.Confirmed:
+                                                    transaction.DeliveryPending = false;
+                                                    break;
 
-                                                    default:
-                                                        logger.LogWarning($"InviteServer Transaction entered an unexpected transaction state {transaction.TransactionState}.");
-                                                        transaction.DeliveryFailed = true;
-                                                        break;
-                                                }
-                                                break;
+                                                default:
+                                                    logger.LogWarning($"NonInvite Transaction entered an unexpected transaction state {transaction.TransactionState}.");
+                                                    transaction.DeliveryFailed = true;
+                                                    break;
+                                            }
+                                            break;
 
-                                            case SIPTransactionTypesEnum.InviteClient:
+                                        default:
+                                            logger.LogWarning($"Unrecognised transaction type {transaction.TransactionType}.");
+                                            break;
+                                    }
 
-                                                switch (transaction.TransactionState)
-                                                {
-                                                    case SIPTransactionStatesEnum.Calling:
-                                                        sendResult = SendTransactionRequest(transaction).Result;
-                                                        break;
+                                    if (sendResult != SocketError.Success && sendResult != SocketError.InProgress)
+                                    {
+                                        logger.LogWarning($"SIP transaction send failed in state {transaction.TransactionState} with error {sendResult}.");
 
-                                                    case SIPTransactionStatesEnum.Trying:
-                                                        break;
-
-                                                    case SIPTransactionStatesEnum.Proceeding:
-                                                        transaction.DeliveryPending = false;
-                                                        break;
-
-                                                    case SIPTransactionStatesEnum.Completed:
-                                                        transaction.DeliveryPending = false;
-                                                        break;
-
-                                                    case SIPTransactionStatesEnum.Confirmed:
-                                                        transaction.DeliveryPending = false;
-                                                        break;
-
-                                                    case SIPTransactionStatesEnum.Cancelled:
-                                                        transaction.DeliveryPending = false;
-                                                        break;
-
-                                                    default:
-                                                        logger.LogWarning($"InviteClient Transaction entered an unexpected transaction state {transaction.TransactionState}.");
-                                                        transaction.DeliveryFailed = true;
-                                                        break;
-                                                }
-
-                                                break;
-
-                                            case SIPTransactionTypesEnum.NonInvite:
-
-                                                switch (transaction.TransactionState)
-                                                {
-                                                    case SIPTransactionStatesEnum.Calling:
-                                                        sendResult = SendTransactionRequest(transaction).Result;
-                                                        break;
-
-                                                    case SIPTransactionStatesEnum.Trying:
-                                                        break;
-
-                                                    case SIPTransactionStatesEnum.Proceeding:
-                                                        break;
-
-                                                    case SIPTransactionStatesEnum.Completed:
-                                                        if (transaction.TransactionFinalResponse != null)
-                                                        {
-                                                            // Sending a single final response on a non-INVITE tx. The same response
-                                                            // will be automatically resent if the same request is received.
-
-                                                            // If retransmits are disabled we must wait for DNS when sending. By default the DNS lookup mechanism
-                                                            // will silently do nothing if the lookup result is not in the cache and relies on the result
-                                                            // being ready for a subsequent SIP retransmit. This mechanism won't work if SIP retransmits are disabled.
-                                                            bool waitForDns = DisableRetransmitSending;
-
-                                                            sendResult = m_sipTransport.SendResponseAsync(transaction.TransactionFinalResponse, waitForDns).Result;
-                                                            transaction.DeliveryPending = false;
-                                                        }
-                                                        break;
-
-                                                    case SIPTransactionStatesEnum.Confirmed:
-                                                        transaction.DeliveryPending = false;
-                                                        break;
-
-                                                    default:
-                                                        logger.LogWarning($"NonInvite Transaction entered an unexpected transaction state {transaction.TransactionState}.");
-                                                        transaction.DeliveryFailed = true;
-                                                        break;
-                                                }
-                                                break;
-
-                                            default:
-                                                logger.LogWarning($"Unrecognised transaction type {transaction.TransactionType}.");
-                                                break;
-                                        }
-
-                                        if (sendResult != SocketError.Success && sendResult != SocketError.InProgress)
-                                        {
-                                            logger.LogWarning($"SIP transaction send failed in state {transaction.TransactionState} with error {sendResult}.");
-
-                                            // Example of failures here are requiring a specific TCP or TLS connection that no longer exists
-                                            // or attempting to send to a UDP socket that has previously returned an ICMP error.
-                                            transaction.Failed(sendResult);
-                                        }
+                                        // Example of failures here are requiring a specific TCP or TLS connection that no longer exists
+                                        // or attempting to send to a UDP socket that has previously returned an ICMP error.
+                                        transaction.Failed(sendResult);
                                     }
                                 }
                             }
-                            catch (Exception excp)
-                            {
-                                logger.LogError($"Exception processing pending transactions. {excp.Message}");
-                            }
                         }
-
-                        RemoveExpiredTransactions();
-
-                        Thread.Sleep(TXCHECK_WAIT_MILLISECONDS);
+                        catch (Exception excp)
+                        {
+                            logger.LogError($"Exception processing pending transactions. {excp.Message}");
+                        }
                     }
+
+                    RemoveExpiredTransactions();
+
+                    Thread.Sleep(TXCHECK_WAIT_MILLISECONDS);
                 }
             }
             catch (Exception excp)

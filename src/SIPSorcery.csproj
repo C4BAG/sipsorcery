@@ -53,8 +53,8 @@
 -v6.0.1-pre: Added .net6 target.</PackageReleaseNotes>
     <NeutralLanguage>en</NeutralLanguage>
     <Version>6.0.8</Version>
-    <AssemblyVersion>6.0.8</AssemblyVersion>
-    <FileVersion>6.0.8</FileVersion>
+    <AssemblyVersion>6.0.9</AssemblyVersion>
+    <FileVersion>6.0.9</FileVersion>
   </PropertyGroup>
 
   <PropertyGroup Label="SourceLink">
