@@ -20,7 +20,7 @@ using Microsoft.Extensions.Logging;
 
 namespace SIPSorcery.Sys
 {
-    internal class Log
+    public static class Log
     {
         private const string LOG_CATEGORY = "sipsorcery";
 
@@ -30,7 +30,7 @@ namespace SIPSorcery.Sys
         }
 
         private static ILogger _logger;
-        internal static ILogger Logger
+        public static ILogger Logger
         {
             get
             {
@@ -51,7 +51,7 @@ namespace SIPSorcery.Sys
         /// Intended to be called if the application wide logging configuration changes. Will force
         /// the singleton logger to be re-created.
         /// </summary>
-        internal static void Reset()
+        public static void Reset()
         {
             _logger = null;
         }

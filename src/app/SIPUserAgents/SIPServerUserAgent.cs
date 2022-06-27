@@ -110,6 +110,12 @@ namespace SIPSorcery.SIP.App
         /// </summary>
         public event Action<SIPDialogue> OnDialogueCreated;
 
+        /// <summary>
+        /// The underlying invite transaction has changed state.
+        /// </summary>
+        public event SIPUASStateChangedDelegate UASStateChanged;
+        public delegate void SIPUASStateChangedDelegate(ISIPServerUserAgent uas, SIPResponseStatusCodesEnum statusCode, string reasonPhrase);
+
         public SIPServerUserAgent(
             SIPTransport sipTransport,
             SIPEndPoint outboundProxy,
@@ -191,7 +197,7 @@ namespace SIPSorcery.SIP.App
                     }
                     else
                     {
-                        //UASStateChanged?.Invoke(this, progressStatus, reasonPhrase);
+                        UASStateChanged?.Invoke(this, progressStatus, reasonPhrase);
 
                         // Allow all Trying responses through as some may contain additional useful information on the call state for the caller. 
                         // Also if the response is a 183 Session Progress with audio forward it.
@@ -268,7 +274,7 @@ namespace SIPSorcery.SIP.App
                 }
                 else
                 {
-                    //UASStateChanged?.Invoke(this, SIPResponseStatusCodesEnum.Ok, null);
+                    UASStateChanged?.Invoke(this, SIPResponseStatusCodesEnum.Ok, null);
 
                     if (!toTag.IsNullOrBlank())
                     {
@@ -355,7 +361,7 @@ namespace SIPSorcery.SIP.App
                     }
                     else
                     {
-                        //UASStateChanged?.Invoke(this, failureStatus, reasonPhrase);
+                        UASStateChanged?.Invoke(this, failureStatus, reasonPhrase);
 
                         string failureReason = (!reasonPhrase.IsNullOrBlank()) ? " and " + reasonPhrase : null;
 
