@@ -31,7 +31,7 @@ namespace SIPSorcery.SIP
     /// overhead than UDP. The state of the connection has to be monitored and messages on the stream can be spread across
     /// multiple packets.
     /// </summary>
-    public class SIPStreamConnection
+    public class SIPStreamConnection : IDisposable
     {
         public static int MaxSIPTCPMessageSize = SIPConstants.SIP_MAXIMUM_RECEIVE_LENGTH;
         public static int CONNECTION_ID_LENGTH = 7; // Length of the random numeric string to use for connection ID's.
@@ -171,6 +171,19 @@ namespace SIPSorcery.SIP
                     // Try and extract another SIP message from the receive buffer.
                     sipMsgBuffer = SIPMessageBuffer.ParseSIPMessageFromStream(buffer, RecvStartPosn, RecvEndPosn, m_sipEncoding, out bytesSkipped);
                 }
+            }
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                StreamSocket?.Close();
+                RecvSocketArgs?.Dispose();
+                SslStream?.Dispose();
+            }
+            catch
+            {
             }
         }
     }

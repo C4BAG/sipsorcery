@@ -266,6 +266,18 @@ namespace SIPSorcery.SIP
             }
         }
 
+        private void IO_CompletedDispose(object sender, SocketAsyncEventArgs e)
+        {
+            try
+            {
+                IO_Completed(sender, e);
+            }
+            finally
+            {
+                e.Dispose();
+            }
+        }
+
         /// <summary>
         /// Receive event handler for the newer ReceiveAsync socket call.
         /// </summary>
@@ -351,71 +363,71 @@ namespace SIPSorcery.SIP
 
                 clientSocket.Bind(ListeningEndPoint);
 
-                SocketAsyncEventArgs connectArgs = new SocketAsyncEventArgs
+                using (SocketAsyncEventArgs connectArgs = new SocketAsyncEventArgs())
                 {
-                    RemoteEndPoint = dstEndPoint
-                };
+                    connectArgs.RemoteEndPoint = dstEndPoint;
 
-                // NOTE: The approach of setting the buffer on the connect args worked properly on Windows BUT
-                // not so on Linux. Since it's such a tiny saving skip setting the buffer on the connect and 
-                // do the send once the sockets are connected (use SendOnConnected).
-                // If this is a TCP channel can take a shortcut and set the first send payload on the connect args.
-                //if (buffer != null && buffer.Length > 0 && serverCertificateName == null)
-                //{
-                //    connectArgs.SetBuffer(buffer, 0, buffer.Length);
-                //}
+                    // NOTE: The approach of setting the buffer on the connect args worked properly on Windows BUT
+                    // not so on Linux. Since it's such a tiny saving skip setting the buffer on the connect and 
+                    // do the send once the sockets are connected (use SendOnConnected).
+                    // If this is a TCP channel can take a shortcut and set the first send payload on the connect args.
+                    //if (buffer != null && buffer.Length > 0 && serverCertificateName == null)
+                    //{
+                    //    connectArgs.SetBuffer(buffer, 0, buffer.Length);
+                    //}
 
-                logger.LogDebug($"Attempting TCP connection from {ListeningSIPEndPoint} to {dstEndPoint}.");
+                    logger.LogDebug($"Attempting TCP connection from {ListeningSIPEndPoint} to {dstEndPoint}.");
 
-                // Attempt to connect.
-                TaskCompletionSource<SocketError> connectTcs = new TaskCompletionSource<SocketError>(TaskCreationOptions.RunContinuationsAsynchronously);
-                connectArgs.Completed += (sender, sockArgs) =>
-                {
-                    if (sockArgs.LastOperation == SocketAsyncOperation.Connect)
+                    // Attempt to connect.
+                    TaskCompletionSource<SocketError> connectTcs = new TaskCompletionSource<SocketError>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    connectArgs.Completed += (sender, sockArgs) =>
                     {
-                        connectTcs.SetResult(sockArgs.SocketError);
+                        if (sockArgs.LastOperation == SocketAsyncOperation.Connect)
+                        {
+                            connectTcs.SetResult(sockArgs.SocketError);
+                        }
+                    };
+                    bool willRaiseEvent = clientSocket.ConnectAsync(connectArgs);
+                    if (!willRaiseEvent && connectArgs.LastOperation == SocketAsyncOperation.Connect)
+                    {
+                        connectTcs.SetResult(connectArgs.SocketError);
                     }
-                };
-                bool willRaiseEvent = clientSocket.ConnectAsync(connectArgs);
-                if (!willRaiseEvent && connectArgs.LastOperation == SocketAsyncOperation.Connect)
-                {
-                    connectTcs.SetResult(connectArgs.SocketError);
-                }
 
-                var timeoutTask = Task.Delay(TCP_ATTEMPT_CONNECT_TIMEOUT);
-                var connectResult = await Task.WhenAny(connectTcs.Task, timeoutTask).ConfigureAwait(false);
+                    var timeoutTask = Task.Delay(TCP_ATTEMPT_CONNECT_TIMEOUT);
+                    var connectResult = await Task.WhenAny(connectTcs.Task, timeoutTask).ConfigureAwait(false);
 
-                if (timeoutTask.IsCompleted)
-                {
-                    logger.LogWarning($"SIP {ProtDescr} channel timed out attempting to establish a connection to {dstEndPoint}.");
-                    return SocketError.TimedOut;
-                }
-                else if (connectTcs.Task.Result != SocketError.Success)
-                {
-                    logger.LogWarning($"SIP {ProtDescr} Channel send to {dstEndPoint} failed. Attempt to create a client socket failed with {connectTcs.Task.Result}.");
-                    return connectTcs.Task.Result;
-                }
-                else
-                {
-                    logger.LogDebug($"ConnectAsync SIP {ProtDescr} Channel connect completed result for {ListeningSIPEndPoint}->{dstEndPoint} {connectTcs.Task.Result}.");
-
-                    var remoteSIPEndPoint = new SIPEndPoint(SIPProtocol, clientSocket.RemoteEndPoint as IPEndPoint);
-                    SIPStreamConnection sipStmConn = new SIPStreamConnection(clientSocket,SIPEncoding,SIPBodyEncoding,  remoteSIPEndPoint, SIPProtocol);
-                    sipStmConn.SIPMessageReceived += SIPTCPMessageReceived;
-
-                    var postConnectResult = await OnClientConnect(sipStmConn, serverCertificateName).ConfigureAwait(false);
-
-                    if (postConnectResult != SocketError.Success)
+                    if (timeoutTask.IsCompleted)
                     {
-                        logger.LogWarning($"SIP {ProtDescr} Channel send to {dstEndPoint} failed. Attempt to connect to server at {dstEndPoint} failed with {postConnectResult}.");
+                        logger.LogWarning($"SIP {ProtDescr} channel timed out attempting to establish a connection to {dstEndPoint}.");
+                        return SocketError.TimedOut;
+                    }
+                    else if (connectTcs.Task.Result != SocketError.Success)
+                    {
+                        logger.LogWarning($"SIP {ProtDescr} Channel send to {dstEndPoint} failed. Attempt to create a client socket failed with {connectTcs.Task.Result}.");
+                        return connectTcs.Task.Result;
                     }
                     else
                     {
-                        m_connections.TryAdd(sipStmConn.ConnectionID, sipStmConn);
-                        await SendOnConnected(sipStmConn, buffer).ConfigureAwait(false);
-                    }
+                        logger.LogDebug($"ConnectAsync SIP {ProtDescr} Channel connect completed result for {ListeningSIPEndPoint}->{dstEndPoint} {connectTcs.Task.Result}.");
 
-                    return postConnectResult;
+                        var remoteSIPEndPoint = new SIPEndPoint(SIPProtocol, clientSocket.RemoteEndPoint as IPEndPoint);
+                        SIPStreamConnection sipStmConn = new SIPStreamConnection(clientSocket,SIPEncoding,SIPBodyEncoding,  remoteSIPEndPoint, SIPProtocol);
+                        sipStmConn.SIPMessageReceived += SIPTCPMessageReceived;
+
+                        var postConnectResult = await OnClientConnect(sipStmConn, serverCertificateName).ConfigureAwait(false);
+
+                        if (postConnectResult != SocketError.Success)
+                        {
+                            logger.LogWarning($"SIP {ProtDescr} Channel send to {dstEndPoint} failed. Attempt to connect to server at {dstEndPoint} failed with {postConnectResult}.");
+                        }
+                        else
+                        {
+                            m_connections.TryAdd(sipStmConn.ConnectionID, sipStmConn);
+                            await SendOnConnected(sipStmConn, buffer).ConfigureAwait(false);
+                        }
+
+                        return postConnectResult;
+                    }
                 }
             }
             catch (Exception excp)
@@ -550,7 +562,7 @@ namespace SIPSorcery.SIP
                     var args = new SocketAsyncEventArgs();
                     args.UserToken = sipStreamConn;
                     args.SetBuffer(buffer, 0, buffer.Length);
-                    args.Completed += IO_Completed;
+                    args.Completed += IO_CompletedDispose;
                     if (!sipStreamConn.StreamSocket.SendAsync(args))
                     {
                         ProcessSend(args);
@@ -590,8 +602,6 @@ namespace SIPSorcery.SIP
 
                     if (m_connections.TryRemove(connection.ConnectionID, out _))
                     {
-                        var socket = connection.StreamSocket;
-
                         // Important: Due to the way TCP works the end of the connection that initiates the close
                         // is meant to go into a TIME_WAIT state. On Windows that results in the same pair of sockets
                         // being unable to reconnect for 30s. SIP can deal with stray and duplicate messages at the 
@@ -610,7 +620,7 @@ namespace SIPSorcery.SIP
                         // sends the graceful FIN-ACK.
                         // TODO: Research if there is a way to force a socket reset with dotnet on LINUX.
 
-                        socket.Close();
+                        connection.Dispose();
                     }
                 }
             }
@@ -704,7 +714,7 @@ namespace SIPSorcery.SIP
                         try
                         {
                             // See explanation in OnSIPStreamSocketDisconnected on why the close is done on the socket and NOT the stream.
-                            streamConnection.StreamSocket?.Close();
+                            streamConnection.Dispose();
                         }
                         catch (Exception closeExcp)
                         {
@@ -765,15 +775,14 @@ namespace SIPSorcery.SIP
 
                                 if (inactiveConnectionKey != null)
                                 {
-                                    inactiveConnection = m_connections[inactiveConnectionKey];
-                                    m_connections.TryRemove(inactiveConnectionKey, out _);
+                                    m_connections.TryRemove(inactiveConnectionKey, out inactiveConnection);
                                 }
                             }
 
                             if (inactiveConnection != null)
                             {
                                 logger.LogDebug($"Pruning inactive connection on {ProtDescr} {ListeningSIPEndPoint} to remote end point {inactiveConnection.RemoteSIPEndPoint}.");
-                                inactiveConnection.StreamSocket.Close();
+                                inactiveConnection.Dispose();
                             }
                             else
                             {
