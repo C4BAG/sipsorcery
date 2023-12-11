@@ -15,6 +15,7 @@
 //-----------------------------------------------------------------------------
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using Microsoft.Extensions.Logging;
@@ -25,6 +26,29 @@ namespace SIPSorcery.net.RTP
 {
     public class MediaStream
     {
+        protected internal class PendingPackages
+        {
+            public RTPHeader hdr;
+            public int localPort;
+            public IPEndPoint remoteEndPoint;
+            public byte[] buffer;
+            public VideoStream videoStream;
+
+            public PendingPackages() { }
+
+            public PendingPackages(RTPHeader hdr, int localPort, IPEndPoint remoteEndPoint, byte[] buffer, VideoStream videoStream)
+            {
+                this.hdr = hdr;
+                this.localPort = localPort;
+                this.remoteEndPoint = remoteEndPoint;
+                this.buffer = buffer;
+                this.videoStream = videoStream;
+            }
+        }
+
+        protected object _pendingPackagesLock = new object();
+        protected List<PendingPackages> _pendingPackagesBuffer = new List<PendingPackages>();
+
         private static ILogger logger = Log.Logger;
 
         private uint m_lastRtpTimestamp;
@@ -40,9 +64,11 @@ namespace SIPSorcery.net.RTP
 
         protected RTPChannel rtpChannel = null;
 
+        protected bool _isClosed = false;
+
         public int Index = -1;
 
-    #region EVENTS
+        #region EVENTS
 
         /// <summary>
         /// Fires when the connection for a media type is classified as timed out due to not
@@ -74,9 +100,11 @@ namespace SIPSorcery.net.RTP
         /// </summary>
         public event Action<int, IPEndPoint, SDPMediaTypesEnum, RTCPCompoundPacket> OnReceiveReportByIndex;
 
-    #endregion EVENTS
+        public event Action<bool> OnIsClosedStateChanged;
 
-    #region PROPERTIES
+        #endregion EVENTS
+
+        #region PROPERTIES
 
         public Boolean AcceptRtpFromAny { get; set; } = false;
 
@@ -84,7 +112,26 @@ namespace SIPSorcery.net.RTP
         /// Indicates whether the session has been closed. Once a session is closed it cannot
         /// be restarted.
         /// </summary>
-        public bool IsClosed { get; set; } = false;
+        public bool IsClosed
+        {
+            get
+            {
+                return _isClosed;
+            }
+            set
+            {
+                if (_isClosed == value)
+                {
+                    return;
+                }
+                _isClosed = value;
+
+                //Clear previous buffer
+                ClearPendingPackages();
+
+                OnIsClosedStateChanged?.Invoke(_isClosed);
+            }
+        }
 
         /// <summary>
         /// In order to detect RTP events from the remote party this property needs to 
@@ -156,9 +203,9 @@ namespace SIPSorcery.net.RTP
         /// </summary>
         public IPEndPoint ControlDestinationEndPoint { get; set; }
 
-    #endregion PROPERTIES
+        #endregion PROPERTIES
 
-    #region REORDER BUFFER
+        #region REORDER BUFFER
 
         public void AddBuffer(TimeSpan dropPacketTimeout)
         {
@@ -180,11 +227,11 @@ namespace SIPSorcery.net.RTP
             return RTPReorderBuffer;
         }
 
-    #endregion REORDER BUFFER
+        #endregion REORDER BUFFER
 
-    #region SECURITY CONTEXT
+        #region SECURITY CONTEXT
 
-        public void SetSecurityContext( ProtectRtpPacket protectRtp, ProtectRtpPacket unprotectRtp, ProtectRtpPacket protectRtcp, ProtectRtpPacket unprotectRtcp)
+        public void SetSecurityContext(ProtectRtpPacket protectRtp, ProtectRtpPacket unprotectRtp, ProtectRtpPacket protectRtcp, ProtectRtpPacket unprotectRtcp)
         {
             if (SecureContext != null)
             {
@@ -192,6 +239,8 @@ namespace SIPSorcery.net.RTP
             }
 
             SecureContext = new SecureContext(protectRtp, unprotectRtp, protectRtcp, unprotectRtcp);
+
+            DispatchPendingPackages();
         }
 
         public SecureContext GetSecurityContext()
@@ -244,16 +293,16 @@ namespace SIPSorcery.net.RTP
 
         public SrtpHandler GetOrCreateSrtpHandler()
         {
-            if(SrtpHandler == null)
+            if (SrtpHandler == null)
             {
                 SrtpHandler = new SrtpHandler();
             }
             return SrtpHandler;
         }
 
-    #endregion SECURITY CONTEXT
+        #endregion SECURITY CONTEXT
 
-    #region RTP CHANNEL
+        #region RTP CHANNEL
 
         public void AddRtpChannel(RTPChannel rtpChannel)
         {
@@ -270,13 +319,13 @@ namespace SIPSorcery.net.RTP
             return rtpChannel;
         }
 
-    #endregion RTP CHANNEL
+        #endregion RTP CHANNEL
 
-    #region SEND PACKET
+        #region SEND PACKET
 
         protected Boolean CheckIfCanSendRtpRaw()
         {
-            if(IsClosed)
+            if (IsClosed)
             {
                 logger.LogWarning($"SendRtpRaw was called for an {MediaType} packet on an closed RTP session.");
                 return false;
@@ -288,7 +337,7 @@ namespace SIPSorcery.net.RTP
                 return false;
             }
 
-            if ( (LocalTrack.StreamStatus == MediaStreamStatusEnum.RecvOnly) || (LocalTrack.StreamStatus == MediaStreamStatusEnum.Inactive) )
+            if ((LocalTrack.StreamStatus == MediaStreamStatusEnum.RecvOnly) || (LocalTrack.StreamStatus == MediaStreamStatusEnum.Inactive))
             {
                 logger.LogWarning($"SendRtpRaw was called for an {MediaType} packet on an RTP session with a Stream Status set to {LocalTrack.StreamStatus}");
                 return false;
@@ -358,14 +407,41 @@ namespace SIPSorcery.net.RTP
         }
 
         /// <summary>
+        /// Allows additional control for sending raw RTCP payloads
+        /// </summary>
+        /// <param name="rtcpBytes">Raw RTCP report data to send.</param>
+        public void SendRtcpRaw(byte[] rtcpBytes)
+        {
+            if (SendRtcpReport(rtcpBytes))
+            {
+                RTCPCompoundPacket rtcpCompoundPacket = null;
+                try
+                {
+                    rtcpCompoundPacket = new RTCPCompoundPacket(rtcpBytes);
+                }
+                catch (Exception excp)
+                {
+                    logger.LogWarning($"Can't create RTCPCompoundPacket from the provided RTCP bytes. {excp.Message}");
+                }
+
+                if (rtcpCompoundPacket != null)
+                {
+                    OnSendReportByIndex?.Invoke(Index, MediaType, rtcpCompoundPacket);
+                }
+            }
+        }
+
+        /// <summary>
         /// Sends the RTCP report to the remote call party.
         /// </summary>
-        /// <param name="report">The serialised RTCP report to send.</param>
-        private void SendRtcpReport(byte[] reportBuffer)
+        /// <param name="reportBuffer">The serialised RTCP report to send.</param>
+        /// <returns>True if report was sent</returns>
+        private bool SendRtcpReport(byte[] reportBuffer)
         {
             if ((RtpSessionConfig.IsSecure || RtpSessionConfig.UseSdpCryptoNegotiation) && !IsSecurityContextReady())
             {
                 logger.LogWarning("SendRtcpReport cannot be called on a secure session before calling SetSecurityContext.");
+                return false;
             }
             else if (ControlDestinationEndPoint != null)
             {
@@ -396,6 +472,8 @@ namespace SIPSorcery.net.RTP
                     }
                 }
             }
+
+            return true;
         }
 
         /// <summary>
@@ -417,7 +495,7 @@ namespace SIPSorcery.net.RTP
                 OnSendReportByIndex?.Invoke(Index, MediaType, report);
             }
         }
-         
+
         /// <summary>
         /// Allows sending of RTCP feedback reports.
         /// </summary>
@@ -429,9 +507,9 @@ namespace SIPSorcery.net.RTP
             SendRtcpReport(reportBytes);
         }
 
-    #endregion SEND PACKET
+        #endregion SEND PACKET
 
-    #region RECEIVE PACKET
+        #region RECEIVE PACKET
 
         public void OnReceiveRTPPacket(RTPHeader hdr, int localPort, IPEndPoint remoteEndPoint, byte[] buffer, VideoStream videoStream = null)
         {
@@ -440,6 +518,9 @@ namespace SIPSorcery.net.RTP
             {
                 if (!EnsureBufferUnprotected(buffer, hdr, out rtpPacket))
                 {
+                    // Cache pending packages to use it later to prevent missing frames
+                    // when DTLS was not completed yet as a Server bt already completed as a client
+                    AddPendingPackage(hdr, localPort, remoteEndPoint, buffer, videoStream);
                     return;
                 }
 
@@ -486,10 +567,11 @@ namespace SIPSorcery.net.RTP
                 return;
             }
 
-            var format = RemoteTrack.GetFormatForPayloadID(hdr.PayloadType);
-            if ( (rtpPacket != null) && (format != null) )
+            // When receiving an Payload from other peer, it will be related to our LocalDescription,
+            // not to RemoteDescription (as proved by Azure WebRTC Implementation)
+            var format = LocalTrack?.GetFormatForPayloadID(hdr.PayloadType);
+            if ((rtpPacket != null) && (format != null))
             {
-                
                 if (UseBuffer())
                 {
                     var reorderBuffer = GetBuffer();
@@ -515,9 +597,9 @@ namespace SIPSorcery.net.RTP
             }
         }
 
-    #endregion RECEIVE PACKET
+        #endregion RECEIVE PACKET
 
-    #region TO RAISE EVENTS FROM INHERITED CLASS
+        #region TO RAISE EVENTS FROM INHERITED CLASS
 
         public void RaiseOnReceiveReportByIndex(IPEndPoint ipEndPoint, RTCPCompoundPacket rtcpPCompoundPacket)
         {
@@ -539,7 +621,69 @@ namespace SIPSorcery.net.RTP
             OnTimeoutByIndex?.Invoke(Index, mediaType);
         }
 
-    #endregion TO RAISE EVENTS FROM INHERITED CLASS
+        #endregion TO RAISE EVENTS FROM INHERITED CLASS
+
+        #region PENDING PACKAGES LOGIC
+
+        // Submit all previous cached packages to self
+        protected virtual void DispatchPendingPackages()
+        {
+            PendingPackages[] pendingPackagesArray = null;
+
+            var isContextValid = SecureContext != null && !IsClosed;
+
+            lock (_pendingPackagesLock)
+            {
+                if (isContextValid)
+                {
+                    pendingPackagesArray = _pendingPackagesBuffer.ToArray();
+                }
+                _pendingPackagesBuffer.Clear();
+            }
+            if (isContextValid)
+            {
+                foreach (var pendingPackage in pendingPackagesArray)
+                {
+                    if (pendingPackage != null)
+                    {
+                        OnReceiveRTPPacket(pendingPackage.hdr, pendingPackage.localPort, pendingPackage.remoteEndPoint, pendingPackage.buffer, pendingPackage.videoStream);
+                    }
+                }
+            }
+        }
+
+        // Clear previous buffer
+        protected virtual void ClearPendingPackages()
+        {
+            lock (_pendingPackagesLock)
+            {
+                _pendingPackagesBuffer.Clear();
+            }
+        }
+
+        // Cache pending packages to use it later to prevent missing frames
+        // when DTLS was not completed yet as a Server but already completed as a client
+        protected virtual bool AddPendingPackage(RTPHeader hdr, int localPort, IPEndPoint remoteEndPoint, byte[] buffer, VideoStream videoStream = null)
+        {
+            const int MAX_PENDING_PACKAGES_BUFFER_SIZE = 32;
+
+            if (SecureContext == null && !IsClosed)
+            {
+                lock (_pendingPackagesLock)
+                {
+                    //ensure buffer max size
+                    while (_pendingPackagesBuffer.Count > 0 && _pendingPackagesBuffer.Count >= MAX_PENDING_PACKAGES_BUFFER_SIZE)
+                    {
+                        _pendingPackagesBuffer.RemoveAt(0);
+                    }
+                    _pendingPackagesBuffer.Add(new PendingPackages(hdr, localPort, remoteEndPoint, buffer, videoStream));
+                }
+                return true;
+            }
+            return false;
+        }
+
+        #endregion
 
         protected void LogIfWrongSeqNumber(string trackType, RTPHeader header, MediaStreamTrack track)
         {
@@ -657,12 +801,12 @@ namespace SIPSorcery.net.RTP
                 if (MediaType == SDPMediaTypesEnum.audio)
                 {
 
-                    format = SDPAudioVideoMediaFormat.GetCompatibleFormats(LocalTrack.Capabilities, RemoteTrack.Capabilities)
+                    format = SDPAudioVideoMediaFormat.GetCompatibleFormats(RemoteTrack.Capabilities, LocalTrack.Capabilities)
                         .Where(x => x.ID != RemoteRtpEventPayloadID).FirstOrDefault();
                 }
                 else
                 {
-                    format = SDPAudioVideoMediaFormat.GetCompatibleFormats(LocalTrack.Capabilities, RemoteTrack.Capabilities).First();
+                    format = SDPAudioVideoMediaFormat.GetCompatibleFormats(RemoteTrack.Capabilities, LocalTrack.Capabilities).First();
                 }
 
                 if (format.IsEmpty())
@@ -686,10 +830,13 @@ namespace SIPSorcery.net.RTP
         {
             header.GetHeaderExtensions().ToList().ForEach(x =>
             {
-                var ntpTimestamp = x.GetNtpTimestamp(RemoteTrack.HeaderExtensions);
-                if (ntpTimestamp.HasValue)
+                if (RemoteTrack != null)
                 {
-                    RemoteTrack.LastAbsoluteCaptureTimestamp = new TimestampPair() { NtpTimestamp = ntpTimestamp.Value, RtpTimestamp = header.Timestamp };
+                    var ntpTimestamp = x.GetNtpTimestamp(RemoteTrack.HeaderExtensions);
+                    if (ntpTimestamp.HasValue)
+                    {
+                        RemoteTrack.LastAbsoluteCaptureTimestamp = new TimestampPair() { NtpTimestamp = ntpTimestamp.Value, RtpTimestamp = header.Timestamp };
+                    }
                 }
             });
         }
@@ -700,5 +847,4 @@ namespace SIPSorcery.net.RTP
             this.Index = index;
         }
     }
-
 }

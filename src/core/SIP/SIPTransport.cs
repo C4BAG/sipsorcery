@@ -311,6 +311,7 @@ namespace SIPSorcery.SIP
                 m_cts.Cancel();
                 m_inMessageArrived.Set();
                 m_transactionEngine?.Shutdown();
+                m_transactionEngine?.Dispose();
 
                 foreach (SIPChannel channel in m_sipChannels.Values)
                 {
@@ -498,7 +499,7 @@ namespace SIPSorcery.SIP
 
             var cacheResult = ResolveSIPUriFromCacheCallback(lookupURI, PreferIPv6NameResolution);
 
-            if (cacheResult == SIPEndPoint.Empty)
+            if (cacheResult == null || cacheResult == SIPEndPoint.Empty)
             {
                 return SocketError.HostNotFound;
             }
@@ -684,7 +685,7 @@ namespace SIPSorcery.SIP
 
                 var cacheResult = ResolveSIPUriFromCacheCallback(topViaUri, PreferIPv6NameResolution);
 
-                if (cacheResult == SIPEndPoint.Empty)
+                if (cacheResult == null || cacheResult == SIPEndPoint.Empty)
                 {
                     return SocketError.HostNotFound;
                 }
