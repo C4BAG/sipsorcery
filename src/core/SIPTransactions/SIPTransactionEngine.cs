@@ -490,6 +490,10 @@ namespace SIPSorcery.SIP
                                 }
                             }
                         }
+                        catch (Exception excp)
+                        {
+                            logger.LogError($"Exception processing pending transactions. {excp.Message}");
+                        }
 
                         RemoveExpiredTransactions();
 
